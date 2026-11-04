@@ -10,9 +10,28 @@ Run from the repository root with::
 
     uv run python tasks/task_3.py
 
+If the ``arxiv_papers`` collection does not exist yet (only the Qdrant container is
+running, see ``docker-compose.yml``), the script first creates it and loads
+``ml-arxiv-embeddings.json`` into it **in batches**, then waits for the collection to be
+green before measuring anything.
+
+The loading is designed for a machine with ~1 GB of free RAM:
+
+* the 12 GB JSON Lines file is streamed line by line and upserted in batches of
+  ``BATCH_SIZE`` points with ``wait=True``, so neither the script nor Qdrant ever holds
+  more than one batch in flight;
+* vectors (~2.5 GB) and the HNSW graph are stored on disk (memory-mapped), payloads too
+  (Qdrant default), so the OS page cache keeps only what fits in RAM;
+* HNSW indexing is deferred (``indexing_threshold=0``) during the upload and enabled once
+  every point is in, so the graph is built once instead of competing with the ingestion.
+
+``indexing_threshold == 0`` therefore also marks an unfinished load: if the script is
+interrupted, running it again re-upserts the file (point IDs are UUIDv5 of the arXiv ID,
+so nothing is duplicated) and then enables indexing.
+
 Connection settings default to ``localhost:6333`` and the ``arxiv_papers``
-collection; they can be overridden with the ``QDRANT_HOST``, ``QDRANT_PORT``
-and ``COLLECTION_NAME`` environment variables (or a ``.env`` file).
+collection; they can be overridden with the ``QDRANT_HOST``, ``QDRANT_PORT``,
+``COLLECTION_NAME`` and ``EMBEDDING_FILE_PATH`` environment variables (or a ``.env`` file).
 """
 
 from __future__ import annotations
@@ -23,9 +42,11 @@ import os
 import statistics
 import sys
 import time
-from collections.abc import Iterable, Sequence
+import uuid
+from collections.abc import Generator, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 from dotenv import load_dotenv
@@ -35,7 +56,7 @@ from qdrant_client.http.models import SearchParams, VectorParams
 
 K: int = 10
 QUERIES_FILE: Path = Path(__file__).resolve().parent.parent / "dataset" / "queries_embeddings.json"
-CLIENT_TIMEOUT_SECONDS: int = 30
+CLIENT_TIMEOUT_SECONDS: int = 60
 WARM_UP_QUERIES: int = 10
 # The exact baseline must run on the original vectors, not on the quantized ones.
 EXACT_SEARCH_PARAMS: SearchParams = SearchParams(
@@ -52,12 +73,21 @@ QUANTIZATION_CONFIG: models.ScalarQuantization = models.ScalarQuantization(
     ),
 )
 # How long to wait for Qdrant to build the quantized vectors after the collection update.
-OPTIMIZATION_TIMEOUT_SECONDS: float = 300.0
+# Vectors are on disk and indexing uses few threads, so rebuilding 411k points takes a while.
+OPTIMIZATION_TIMEOUT_SECONDS: float = 3600.0
 OPTIMIZATION_POLL_SECONDS: float = 1.0
 
 DEFAULT_QDRANT_HOST: str = "localhost"
 DEFAULT_QDRANT_PORT: int = 6333
 DEFAULT_COLLECTION_NAME: str = "arxiv_papers"
+DEFAULT_EMBEDDING_FILE: Path = Path(__file__).resolve().parent.parent / "ml-arxiv-embeddings.json"
+
+VECTOR_DIMENSION: int = 1536  # text-embedding-ada-002
+BATCH_SIZE: int = 500
+DEFERRED_INDEXING_THRESHOLD: int = 0  # no HNSW build while uploading
+DEFAULT_INDEXING_THRESHOLD: int = 10_000  # Qdrant default (KB), restored after the upload
+MAX_INDEXING_THREADS: int = 2  # fewer threads -> lower peak RAM while building HNSW
+GREEN_POLL_SECONDS: float = 10.0
 
 
 class SetupError(RuntimeError):
@@ -71,6 +101,7 @@ class Settings:
     host: str = DEFAULT_QDRANT_HOST
     port: int = DEFAULT_QDRANT_PORT
     collection_name: str = DEFAULT_COLLECTION_NAME
+    embedding_file: Path = DEFAULT_EMBEDDING_FILE
 
 
 def load_settings() -> Settings:
@@ -95,7 +126,128 @@ def load_settings() -> Settings:
         host=os.getenv("QDRANT_HOST", DEFAULT_QDRANT_HOST),
         port=port,
         collection_name=os.getenv("COLLECTION_NAME", DEFAULT_COLLECTION_NAME),
+        embedding_file=Path(os.getenv("EMBEDDING_FILE_PATH", str(DEFAULT_EMBEDDING_FILE))),
     )
+
+
+def create_collection(client: QdrantClient, collection_name: str) -> None:
+    """Create the collection for the arXiv embeddings with a low-RAM, deferred-indexing setup.
+
+    Distance and size are the ones of the 'Vector database with Qdrant' project (cosine, 1536);
+    HNSW parameters (``m``, ``ef_construct``...) stay at their defaults.
+    """
+    client.create_collection(
+        collection_name=collection_name,
+        vectors_config=models.VectorParams(size=VECTOR_DIMENSION, distance=models.Distance.COSINE, on_disk=True),
+        hnsw_config=models.HnswConfigDiff(on_disk=True, max_indexing_threads=MAX_INDEXING_THREADS),
+        optimizers_config=models.OptimizersConfigDiff(indexing_threshold=DEFERRED_INDEXING_THRESHOLD),
+        on_disk_payload=True,
+    )
+    print(f"Collection '{collection_name}' created (vectors on disk, indexing deferred).")
+
+
+def stream_json(file_path: Path) -> Generator[Any, Any, None]:
+    """Yield one record per non-empty line, without ever loading the whole file into memory."""
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                yield json.loads(line)
+
+
+def load_vectors_to_qdrant(
+    client: QdrantClient, collection_name: str, file_path: Path, batch_size: int = BATCH_SIZE
+) -> None:
+    """Upsert the file into the collection in batches of ``batch_size`` points.
+
+    The embedding becomes the vector, every other field goes to the payload; records
+    without an embedding are skipped. ``wait=True`` makes each upsert block until Qdrant
+    has applied the batch, so data never piles up on the server side.
+    """
+    batch: list[models.PointStruct] = []
+    total_records = 0
+    skipped = 0
+    start = time.perf_counter()
+
+    for record in stream_json(file_path):
+        if not record.get("embedding"):
+            skipped += 1
+            continue
+
+        payload = {k: v for k, v in record.items() if k != "embedding"}
+        point = models.PointStruct(
+            id=str(uuid.uuid5(namespace=uuid.NAMESPACE_DNS, name=str(record["id"]))),
+            vector=record["embedding"],
+            payload=payload,
+        )
+        batch.append(point)
+
+        if len(batch) >= batch_size:
+            client.upsert(collection_name=collection_name, points=batch, wait=True)
+            total_records += len(batch)
+            batch = []
+            if total_records % (batch_size * 20) == 0:
+                print(f"Inserted {total_records} records... ({time.perf_counter() - start:.0f} s)")
+
+    if batch:
+        client.upsert(collection_name=collection_name, points=batch, wait=True)
+        total_records += len(batch)
+        batch = []
+
+    print(
+        f"Total records inserted: {total_records} ({skipped} skipped without embedding) "
+        f"in {(time.perf_counter() - start) / 60:.1f} min."
+    )
+
+
+def enable_indexing(client: QdrantClient, collection_name: str) -> None:
+    """Restore the default indexing threshold so Qdrant builds the HNSW graph."""
+    client.update_collection(
+        collection_name=collection_name,
+        optimizers_config=models.OptimizersConfigDiff(indexing_threshold=DEFAULT_INDEXING_THRESHOLD),
+    )
+    print("Upload finished, HNSW indexing enabled.")
+
+
+def wait_until_green(client: QdrantClient, collection_name: str) -> None:
+    """Block until the collection is green: no operation should run while it is ingesting or indexing."""
+    while True:
+        info = client.get_collection(collection_name)
+        if info.status == models.CollectionStatus.GREEN:
+            print(
+                f"Collection '{collection_name}' is green: {info.points_count} points, "
+                f"{info.indexed_vectors_count} indexed vectors."
+            )
+            return
+        print(
+            f"Collection is {info.status.value}: "
+            f"{info.indexed_vectors_count}/{info.points_count} vectors indexed, waiting..."
+        )
+        time.sleep(GREEN_POLL_SECONDS)
+
+
+def ensure_collection_loaded(client: QdrantClient, settings: Settings) -> None:
+    """Create and load the collection if needed, then wait for it to be green.
+
+    A collection whose indexing threshold is still 0 was not fully loaded (interrupted run):
+    the file is upserted again before indexing is enabled.
+    """
+    name = settings.collection_name
+    if not client.collection_exists(name):
+        create_collection(client, name)
+    elif client.get_collection(name).config.optimizer_config.indexing_threshold != DEFERRED_INDEXING_THRESHOLD:
+        wait_until_green(client, name)
+        return
+    else:
+        print(f"Collection '{name}' was not fully loaded: resuming the upload.")
+
+    if not settings.embedding_file.is_file():
+        raise SetupError(
+            f"Embedding file not found: {settings.embedding_file} "
+            "(set EMBEDDING_FILE_PATH to the ml-arxiv-embeddings.json location)."
+        )
+    load_vectors_to_qdrant(client, name, settings.embedding_file)
+    enable_indexing(client, name)
+    wait_until_green(client, name)
 
 
 def load_test_dataset(path: Path) -> dict[str, list[float]]:
@@ -161,7 +313,15 @@ def validate_collection(client: QdrantClient, collection_name: str, dim: int) ->
             "Create and populate it first (see the 'Vector database with Qdrant' project)."
         )
 
-    vectors: VectorParams | dict[str, VectorParams] | None = client.get_collection(collection_name).config.params.vectors
+    info = client.get_collection(collection_name)
+    if info.status != models.CollectionStatus.GREEN:
+        raise SetupError(
+            f"Collection '{collection_name}' is {info.status.value} (still ingesting or indexing: "
+            f"{info.indexed_vectors_count}/{info.points_count} vectors indexed). "
+            "Wait until it is green before measuring."
+        )
+
+    vectors: VectorParams | dict[str, VectorParams] | None = info.config.params.vectors
     if isinstance(vectors, dict) and vectors:
         raise SetupError(
             f"Collection '{collection_name}' uses named vectors ({', '.join(sorted(vectors))}); "
@@ -350,6 +510,7 @@ def main() -> None:
     try:
         test_dataset = load_test_dataset(QUERIES_FILE)
         dim = dataset_dimension(test_dataset)
+        ensure_collection_loaded(client, settings)
         validate_collection(client, settings.collection_name, dim)
         apply_scalar_quantization(client, settings.collection_name)
         for i, rescore in enumerate(RESCORE_VALUES):
@@ -365,8 +526,7 @@ def main() -> None:
     except (ResponseHandlingException, ConnectionError) as exc:
         sys.exit(
             f"Error: cannot reach Qdrant at {settings.host}:{settings.port} ({exc}).\n"
-            "Hint: start the Qdrant Docker container, e.g. "
-            "`docker run -p 6333:6333 -v $(pwd)/qdrant_storage:/qdrant/storage qdrant/qdrant`."
+            "Hint: start the Qdrant Docker container with `docker compose up -d`."
         )
     except UnexpectedResponse as exc:
         sys.exit(
